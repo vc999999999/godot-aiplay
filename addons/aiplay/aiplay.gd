@@ -1,5 +1,5 @@
 extends Node
-## AIPlay 运行时层（协议版本 aiplay/0.2）
+## AIPlay 运行时层（协议版本 aiplay/0.3）
 ##
 ## 随游戏导出：起本地 WebSocket 服务（仅 127.0.0.1）、导出状态快照、
 ## 执行语义动作。协议正文见仓库 PROTOCOL.md，本文件是其参考实现。
@@ -9,11 +9,13 @@ extends Node
 ##     组 aiplay_element / aiplay_hidden 声明谁进快照、谁排除；
 ##   - AIPlay.register_state_provider(callable) → Dictionary 进快照 game 字段；
 ##   - AIPlay.register_actions_provider(callable) → Array 供 actions 方法；
-##   - 节点加入组 aiplay_tools 并声明 const AIPLAY_TOOLS = {...}。
+##   - 节点加入组 aiplay_tools 并声明 const AIPLAY_TOOLS = {...}；
+##   - 逃生舱 call 默认关闭；要开须同时设 aiplay/allow_call=true 并
+##     AIPlay.register_callable("方法名", "节点路径") 逐条放行。
 ## 注意：插件可能未启用，游戏代码请用 get_node_or_null("/root/AIPlay") 判空后调用，
 ## 不要直接写 AIPlay. 标识符（autoload 缺失会导致脚本编译失败）。
 
-const PROTOCOL_VERSION := "aiplay/0.2"
+const PROTOCOL_VERSION := "aiplay/0.3"
 const DEFAULT_PORT := 8765
 const MAX_ELEMENTS := 60
 const MAX_GAME_DICT_BYTES := 4096
@@ -24,13 +26,36 @@ const WAIT_UNTIL_DEFAULT_FRAMES := 3600
 
 const SETTING_ENABLED := "aiplay/enabled"
 const SETTING_PORT := "aiplay/port"
+const SETTING_REQUIRE_TOKEN := "aiplay/require_token"
+const SETTING_ALLOW_CALL := "aiplay/allow_call"
+const SETTING_ALLOW_TIME_SCALE := "aiplay/allow_time_scale"
 
-const CALL_BLOCKED_METHODS := ["free", "queue_free", "exit_tree"]
+const TOKEN_FILE := "user://aiplay.token"
+const TOKEN_BYTES := 24
+const MAX_PEERS := 8
+const MAX_AUTH_FAILS := 3
+const AUTH_GRACE_FRAMES := 600
+
+## 即使进了 callable 白名单也拒绝：销毁、间接调用、状态写入都算绕过
+const CALL_BLOCKED_METHODS := [
+	"free", "queue_free", "exit_tree", "notification",
+	"set", "set_indexed", "set_deferred", "set_script",
+	"call", "callv", "call_deferred", "call_group",
+	"emit_signal", "rpc", "rpc_id", "rpcp",
+	"reparent", "replace_by", "duplicate", "instantiate",
+]
 
 var _tcp := TCPServer.new()
 var _peers: Array[WebSocketPeer] = []
+var _peer_info: Dictionary = {}
 var _listening := false
 var _port := -1
+
+var _require_token := true
+var _token := ""
+var _allow_call := false
+var _allow_time_scale := false
+var _callables: Dictionary = {}
 
 var _state_provider := Callable()
 var _actions_provider := Callable()
@@ -53,11 +78,20 @@ func _init() -> void:
 func _ready() -> void:
 	# 常开：暂停中的游戏也要能被 AI 观察与操作（它是开发工具，不是玩法逻辑）
 	process_mode = Node.PROCESS_MODE_ALWAYS
+	_read_policy()
 	var port_override := _cli_value("--aiplay-port")
 	if port_override != "":
 		_port = int(port_override)
 	if _cli_flag("--aiplay") or bool(ProjectSettings.get_setting(SETTING_ENABLED, false)):
 		start_server()
+
+
+func _read_policy() -> void:
+	_require_token = bool(ProjectSettings.get_setting(SETTING_REQUIRE_TOKEN, true))
+	_allow_call = bool(ProjectSettings.get_setting(SETTING_ALLOW_CALL, false))
+	_allow_time_scale = bool(ProjectSettings.get_setting(SETTING_ALLOW_TIME_SCALE, false))
+	if _cli_flag("--aiplay-no-token"):
+		_require_token = false
 
 
 func _exit_tree() -> void:
@@ -72,18 +106,24 @@ func start_server() -> void:
 	if _listening:
 		return
 	var port := _resolve_port()
+	if _require_token and _token.is_empty():
+		_token = _load_or_create_token()
 	var err := _tcp.listen(port, "127.0.0.1")
 	if err != OK:
 		push_error("AIPlay: cannot listen on 127.0.0.1:%d (error %d)" % [port, err])
 		return
 	_listening = true
 	print("AIPlay: listening on ws://127.0.0.1:%d (protocol %s)" % [port, PROTOCOL_VERSION])
+	if _require_token:
+		# 凭据只落本地文件，不进 stdout / 日志；浏览器读不到这个文件
+		print("AIPlay: token required (user://aiplay.token), pass it as ?token=... on the URL")
 
 
 func stop_server() -> void:
 	for peer in _peers:
 		peer.close()
 	_peers.clear()
+	_peer_info.clear()
 	_pending_waits.clear()
 	_pending_untils.clear()
 	if _listening:
@@ -99,6 +139,42 @@ func _resolve_port() -> int:
 	if _port > 0:
 		return _port
 	return int(ProjectSettings.get_setting(SETTING_PORT, DEFAULT_PORT))
+
+
+# ---------------------------------------------------------------------------
+# 鉴权凭据
+# ---------------------------------------------------------------------------
+
+func _load_or_create_token() -> String:
+	if FileAccess.file_exists(TOKEN_FILE):
+		var rf := FileAccess.open(TOKEN_FILE, FileAccess.READ)
+		if rf != null:
+			var existing := rf.get_as_text().strip_edges()
+			rf.close()
+			if existing.length() >= 32:
+				return existing
+	var raw := Crypto.new().generate_random_bytes(TOKEN_BYTES)
+	var tok := raw.hex_encode()
+	var wf := FileAccess.open(TOKEN_FILE, FileAccess.WRITE)
+	if wf != null:
+		wf.store_string(tok)
+		wf.close()
+	_restrict_token_permissions()
+	return tok
+
+
+## 凭据文件默认是 644，同机其它用户能读——把它收到 600。
+## Windows 没有 chmod 语义，走用户目录 ACL，这里跳过。
+func _restrict_token_permissions() -> void:
+	if OS.get_name() == "Windows":
+		return
+	var abs := ProjectSettings.globalize_path(TOKEN_FILE)
+	OS.execute("chmod", ["600", abs])
+
+
+## 供本地工具/桥读取凭据（同机进程才有权限读 user://）
+func get_token_path() -> String:
+	return ProjectSettings.globalize_path(TOKEN_FILE)
 
 
 func _cli_flag(name: String) -> bool:
@@ -132,6 +208,30 @@ func clear_actions_provider() -> void:
 	_actions_provider = Callable()
 
 
+## 逃生舱白名单：方法名 → 允许被调用的节点路径（场景相对路径或 /场景名/... 的绝对 id）。
+## 不登记的方法即使 aiplay/allow_call=true 也调不通。
+func register_callable(method: String, node_path: String) -> void:
+	if method.is_empty():
+		return
+	_callables[method] = node_path
+
+
+func clear_callables() -> void:
+	_callables.clear()
+
+
+## 当前生效的策略，给本地工具和排障用（不含 token 本身）
+func get_policy() -> Dictionary:
+	return {
+		"protocol": PROTOCOL_VERSION,
+		"require_token": _require_token,
+		"allow_call": _allow_call,
+		"allow_time_scale": _allow_time_scale,
+		"callable_count": _callables.size(),
+		"max_peers": MAX_PEERS,
+	}
+
+
 # ---------------------------------------------------------------------------
 # 网络循环
 # ---------------------------------------------------------------------------
@@ -140,26 +240,72 @@ func _process(_delta: float) -> void:
 	if not _listening:
 		return
 	while _tcp.is_connection_available():
+		var conn := _tcp.take_connection()
+		# 连接数硬上限：多余连接直接丢弃，避免被扫端口/恶意页面拖垮
+		if _peers.size() >= MAX_PEERS:
+			conn.disconnect_from_host()
+			continue
 		var peer := WebSocketPeer.new()
-		peer.accept_stream(_tcp.take_connection())
+		peer.accept_stream(conn)
 		_peers.append(peer)
+		_peer_info[peer] = {"authed": not _require_token, "fails": 0, "frames": 0}
 	var i := _peers.size() - 1
 	while i >= 0:
 		var peer := _peers[i]
 		peer.poll()
 		var state := peer.get_ready_state()
 		if state == WebSocketPeer.STATE_CLOSED:
+			_peer_info.erase(peer)
 			_peers.remove_at(i)
 		elif state == WebSocketPeer.STATE_OPEN:
 			while peer.get_available_packet_count() > 0:
 				_handle_packet(peer, peer.get_packet().get_string_from_utf8())
 		i -= 1
+	_flush_auth_deadlines()
 
 
 func _physics_process(_delta: float) -> void:
 	_phys_frame += 1
 	_tick_waits()
 	_tick_untils()
+
+
+# 未鉴权的连接不给无限期挂着的机会
+func _flush_auth_deadlines() -> void:
+	for peer in _peers:
+		var info: Variant = _peer_info.get(peer)
+		if not (info is Dictionary):
+			continue
+		var d: Dictionary = info
+		if bool(d.get("authed", false)):
+			continue
+		d["frames"] = int(d.get("frames", 0)) + 1
+		if int(d["frames"]) > AUTH_GRACE_FRAMES:
+			peer.close()
+
+
+func _is_authed(peer: WebSocketPeer) -> bool:
+	var info: Variant = _peer_info.get(peer)
+	if not (info is Dictionary):
+		return false
+	return bool((info as Dictionary).get("authed", false))
+
+
+func _auth_error(peer: WebSocketPeer) -> void:
+	var info: Variant = _peer_info.get(peer)
+	if info is Dictionary:
+		var d: Dictionary = info
+		d["fails"] = int(d.get("fails", 0)) + 1
+		if int(d["fails"]) >= MAX_AUTH_FAILS:
+			# 连续猜错直接断开，不做无限次爆破
+			_send(peer, {"id": null, "ok": false, "error": "too many auth failures, closing"})
+			peer.close()
+			return
+	_send(peer, {
+		"id": null,
+		"ok": false,
+		"error": "unauthorized: send {\"method\":\"auth\",\"params\":{\"token\":\"...\"}} first",
+	})
 
 
 func _handle_packet(peer: WebSocketPeer, text: String) -> void:
@@ -173,7 +319,55 @@ func _handle_packet(peer: WebSocketPeer, text: String) -> void:
 	if method.is_empty():
 		_respond_error(peer, id, "missing 'method'")
 		return
+	# auth 是唯一允许在未鉴权状态下调用的方法
+	if method == "auth":
+		_m_auth(peer, id, msg.get("params", {}))
+		return
+	if not _is_authed(peer):
+		_auth_error(peer)
+		return
 	_dispatch(peer, id, method, msg.get("params", {}))
+
+
+func _m_auth(peer: WebSocketPeer, id: Variant, params: Variant) -> void:
+	var p := _params_dict(params)
+	if not _require_token:
+		_mark_authed(peer)
+		_respond(peer, id, {"authed": true, "required": false})
+		return
+	var given := str(p.get("token", ""))
+	if given.is_empty() or not _constant_time_eq(given, _token):
+		var info: Variant = _peer_info.get(peer)
+		if info is Dictionary:
+			var d: Dictionary = info
+			d["fails"] = int(d.get("fails", 0)) + 1
+			if int(d["fails"]) >= MAX_AUTH_FAILS:
+				_send(peer, {"id": id, "ok": false, "error": "too many auth failures, closing"})
+				peer.close()
+				return
+		_respond_error(peer, id, "bad token")
+		return
+	_mark_authed(peer)
+	_respond(peer, id, {"authed": true, "required": true})
+
+
+func _mark_authed(peer: WebSocketPeer) -> void:
+	var info: Variant = _peer_info.get(peer)
+	if info is Dictionary:
+		(info as Dictionary)["authed"] = true
+	else:
+		_peer_info[peer] = {"authed": true, "fails": 0, "frames": 0}
+
+
+func _constant_time_eq(a: String, b: String) -> bool:
+	var ab := a.to_utf8_buffer()
+	var bb := b.to_utf8_buffer()
+	if ab.size() != bb.size():
+		return false
+	var diff := 0
+	for i in ab.size():
+		diff |= ab[i] ^ bb[i]
+	return diff == 0
 
 
 func _dispatch(peer: WebSocketPeer, id: Variant, method: String, params: Variant) -> void:
@@ -234,6 +428,7 @@ func _m_ping() -> Dictionary:
 		"protocol": PROTOCOL_VERSION,
 		"game": str(ProjectSettings.get_setting("application/config/name", "")),
 		"engine": str(Engine.get_version_info().get("string", "")),
+		"auth_required": _require_token,
 	}
 
 
@@ -465,6 +660,18 @@ func _build_call_args(spec: Dictionary, args: Dictionary) -> Dictionary:
 	if not (arg_spec is Dictionary):
 		return out
 	var decl: Dictionary = arg_spec
+	# 多余参数直接报错：静默丢弃会让 AI 传错名字时"什么都没发生"，极难排查
+	var unknown: Array[String] = []
+	for k in args.keys():
+		if not decl.has(str(k)):
+			unknown.append(str(k))
+	if not unknown.is_empty():
+		out["ok"] = false
+		out["error"] = "unknown arg(s): %s (accepted: %s)" % [
+			", ".join(PackedStringArray(unknown)),
+			", ".join(PackedStringArray(decl.keys().map(func(x): return str(x)))),
+		]
+		return out
 	if decl.is_empty():
 		return out
 	var call_args: Array = []
@@ -533,7 +740,15 @@ func _m_click(peer: WebSocketPeer, id: Variant, params: Variant) -> void:
 	if not (node is BaseButton):
 		_respond_error(peer, id, "element is not clickable: " + ref)
 		return
-	(node as BaseButton).pressed.emit()
+	var btn := node as BaseButton
+	# 与真人同权：看不见的、按不动的按钮不该被点到
+	if not btn.is_visible_in_tree():
+		_respond_error(peer, id, "element is not visible: " + ref)
+		return
+	if btn.disabled:
+		_respond_error(peer, id, "element is disabled: " + ref)
+		return
+	btn.pressed.emit()
 	_respond(peer, id, {"clicked": ref, "state": _build_snapshot()})
 
 
@@ -582,6 +797,12 @@ func _parse_key(p: Dictionary) -> int:
 
 
 func _m_call(peer: WebSocketPeer, id: Variant, params: Variant) -> void:
+	# 逃生舱默认整机关闭；打开后仍只走开发者逐条登记的白名单。
+	# 黑名单挡不住 call_deferred("queue_free")、set("gold", 9999) 这一类，
+	# 所以判定标准只有一条：这个方法是不是开发者显式说过"可以给 AI 调"。
+	if not _allow_call:
+		_respond_error(peer, id, "call is disabled (set aiplay/allow_call=true and register callables)")
+		return
 	var p := _params_dict(params)
 	var ref := str(p.get("path", p.get("node", "")))
 	var method := str(p.get("method", ""))
@@ -591,12 +812,20 @@ func _m_call(peer: WebSocketPeer, id: Variant, params: Variant) -> void:
 	if method in CALL_BLOCKED_METHODS or method.begins_with("_"):
 		_respond_error(peer, id, "method not allowed: " + method)
 		return
+	if not _callables.has(method):
+		_respond_error(peer, id, "method not registered as callable: " + method)
+		return
 	var node := _resolve_node(ref)
 	if node == null:
 		_respond_error(peer, id, "node not found: " + ref)
 		return
 	if _is_hidden(node):
 		_respond_error(peer, id, "node is hidden: " + ref)
+		return
+	# 登记的路径必须对得上：防止拿白名单里的方法名去打别的节点
+	var expect_path := str(_callables[method])
+	if not expect_path.is_empty() and not _node_matches(node, expect_path):
+		_respond_error(peer, id, "callable '%s' is bound to %s" % [method, expect_path])
 		return
 	if not node.has_method(method):
 		_respond_error(peer, id, "no such method: " + method)
@@ -605,6 +834,19 @@ func _m_call(peer: WebSocketPeer, id: Variant, params: Variant) -> void:
 	var cargs := _coerce_call_args(raw_args if raw_args is Array else [])
 	var result: Variant = node.callv(method, cargs)
 	_respond(peer, id, {"result": _jsonable(result), "state": _build_snapshot()})
+
+
+func _node_matches(node: Node, expect_path: String) -> bool:
+	var scene := get_tree().current_scene
+	if scene != null:
+		if str(scene.get_path_to(node)) == expect_path:
+			return true
+		if "/" + str(scene.name) + "/" + expect_path == expect_path:
+			return true
+		var full := "/" + str(scene.name) + "/" + str(scene.get_path_to(node))
+		if full == expect_path:
+			return true
+	return str(node.get_path()) == expect_path
 
 
 func _coerce_call_args(raw: Array) -> Array:
@@ -639,6 +881,11 @@ func _resolve_node(ref: String) -> Node:
 
 
 func _m_time_scale(peer: WebSocketPeer, id: Variant, params: Variant) -> void:
+	# 放置游戏里唯一资源就是时间，压时间等于印钱；限时决策游戏里等于无限思考。
+	# 所以默认关，只有开发者显式打开才算"自测用的开关"。
+	if not _allow_time_scale:
+		_respond_error(peer, id, "time_scale is disabled (set aiplay/allow_time_scale=true)")
+		return
 	var p := _params_dict(params)
 	if not p.has("scale"):
 		_respond_error(peer, id, "time_scale requires 'scale'")

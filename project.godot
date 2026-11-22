@@ -22,6 +22,9 @@ AIPlay="*res://addons/aiplay/aiplay.gd"
 
 enabled=true
 port=8765
+require_token=true
+allow_call=false
+allow_time_scale=false
 
 [display]
 

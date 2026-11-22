@@ -1,46 +1,86 @@
-# AIPlay Protocol `aiplay/0.2`
+# AIPlay Protocol `aiplay/0.3`
 
 让外部 AI Agent 以"玩家"身份观察并操作 Godot 游戏的本地协议。
 本文档是参考实现（`addons/aiplay/aiplay.gd` + `bridge/server.mjs`）的协议正文。
 
+> v0.2 → v0.3 是不兼容变更（连接必须先 `auth`）。变更清单见 [CHANGELOG.md](CHANGELOG.md)，
+> 每条都附了"为什么必须改"，其中三条是实测出的安全漏洞，不是设计口味。
+
 ## 传输
 
-- `ws://127.0.0.1:8765`（端口可用 `aiplay/port` 项目设置或 `--aiplay-port=N` 覆盖；`--aiplay` 命令行参数强制启用）
+- `ws://127.0.0.1:8765`（端口可用 `aiplay/port` 项目设置或 `--aiplay-port=N` 覆盖；`--aiplay` 强制启用）
 - **仅绑定回环地址**，不接受外部连接。
+- **连接数上限 8**，超出直接关闭——端口被扫、被反复重连时不会拖垮游戏。
 - 帧为 UTF-8 JSON 文本。请求：`{"id": <任意 JSON 值>, "method": "<名>", "params": {...}}`。
-- 响应：`{"id": <同上>, "ok": true, "result": ...}` 或 `{"id": <同上>, "ok": false, "error": "..."}`。
-- 服务器不主动推送（v0.2 无事件流）；等待类方法在条件满足/超时/帧数到达时才回包。
+- 响应：`{"id": 同上, "ok": true, "result": ...}` 或 `{"id": 同上, "ok": false, "error": "..."}`。
+- 服务器不主动推送（无事件流）；等待类方法在条件满足/超时/帧数到达时才回包。
 
-## 默认开关
+## 鉴权（v0.3 新增，默认开启）
 
-- 项目设置 `aiplay/enabled`（默认 `false`）控制运行时服务。
-- 编辑器插件启用时注册 autoload `AIPlay` 与两个项目设置项；游戏侧用 `get_node_or_null("/root/AIPlay")` 判空调用，插件未启用时游戏照常运行。
+浏览器不受同源策略限制，任何网页的 JS 都能连 `127.0.0.1:8765`。
+Godot 服务端**拿不到入站握手的 Origin 头**（`get_handshake_headers()` 在服务端返回空，
+`StreamPeerTCP` 也无 peek），所以 Origin 白名单在当前引擎层做不了。
+替代方案是凭据：
+
+1. 首次启动时生成 48 位十六进制 token，写入 `user://aiplay.token`（本机文件，浏览器读不到）。
+2. 连接后**第一个**必须发的请求是 `auth`：
+   ```json
+   {"id": 1, "method": "auth", "params": {"token": "<user://aiplay.token 的内容>"}}
+   ```
+3. 未鉴权的连接只能发 `auth`；其它方法一律返回 `unauthorized` 错误。
+4. 连续 3 次 token 错误即断开；未鉴权连接最多存活 600 帧。
+5. token 比较使用定长时间比较，不做长度短路。
+
+关闭鉴权：`aiplay/require_token=false` 或 `--aiplay-no-token`（仅本机调试，不推荐）。
+桥会自动从各平台 `user://` 默认位置读取 token；也可用 `--token` / `AIPLAY_TOKEN` /
+`--token-file` / `AIPLAY_TOKEN_FILE` 指定。
+
+## 默认开关（全部默认关闭/最严）
+
+| 项目设置 | 默认 | 作用 |
+|---|---|---|
+| `aiplay/enabled` | `false` | 运行时服务总开关 |
+| `aiplay/port` | `8765` | 监听端口 |
+| `aiplay/require_token` | `true` | 要求连接先 `auth` |
+| `aiplay/allow_call` | `false` | 打开 `call` 逃生舱（仍须逐条登记白名单） |
+| `aiplay/allow_time_scale` | `false` | 允许改写 `Engine.time_scale` |
+
+编辑器插件启用时注册 autoload `AIPlay` 与上述设置项，**但不写盘**——
+不用 `ProjectSettings.save()` 悄悄改用户的 `project.godot`。
 
 ## 方法
+
+### 鉴权
+
+| method | params | result |
+|---|---|---|
+| `auth` | `{token}` | `{authed: true, required: bool}` 未鉴权连接唯一可调的方法 |
 
 ### 只读
 
 | method | params | result |
 |---|---|---|
-| `ping` | — | `{protocol, game, engine}` |
+| `ping` | — | `{protocol, game, engine, auth_required}` |
 | `state` | — | 快照（见下） |
-| `actions` | — | `{actions: [...]}` 当前合法动作（provider 优先，否则从可见按钮派生） |
+| `actions` | — | `{actions: [...]}` provider 优先，否则由可见按钮派生 |
 | `tools` | — | `{tools: [...]}` 游戏在 `aiplay_tools` 组声明的 `AIPLAY_TOOLS` |
 
 ### 动作
 
 | method | params | result |
 |---|---|---|
-| `invoke` | `{tool: "game_x", args: {...}}` | `{result, state}` 调语义动作；参数按声明类型强转 |
-| `click` | `{id}` 或 `{element}`/`{path}` | `{clicked, state}` 对 `BaseButton` 发 `pressed` 信号；隐藏/不存在报错 |
+| `invoke` | `{tool: "game_x", args: {...}}` | `{result, state}` 参数按声明类型强转；多余/缺失参数都报错 |
+| `click` | `{id}` | `{clicked, state}` 对 `BaseButton` 发 `pressed`；**不可见或 disabled 一律拒绝** |
 | `press` | `{action, pressed?}` | `{action, pressed, state}` `Input.action_press/release` |
-| `key` | `{key}` 或 `{keycode}`，`pressed?` | `{key, pressed, state}` `Input.parse_input_event`；`key` 接受键名（`OS.find_keycode_from_string`）、数字串或单字符 |
-| `call` | `{path, method, args?}` | `{result, state}` 逃生舱：对任意节点调任意方法；`path` 必填，接受元素 id、场景相对路径或 `/root/...` 绝对路径；拦截 `free`/`queue_free`/`exit_tree`/下划线开头方法与 `aiplay_hidden` 子树 |
-| `wait` | `{frames}` 或 `{seconds}` | `{state}` 等 N 个物理帧后返回快照 |
+| `key` | `{key}` 或 `{keycode}`，`pressed?` | `{key, pressed, state}` `Input.parse_input_event` |
+| `call` | `{path, method, args?}` | `{result, state}` 逃生舱，默认关闭；开启后只认登记过的方法名+节点对 |
+| `wait` | `{frames}` 或 `{seconds}` | `{state}` 等 N 个物理帧 |
 | `wait_until` | `{expr, max_frames?}` | `{timeout: bool, state}` 条件等待（见下） |
-| `time_scale` | `{scale}` | `{time_scale, state}` `Engine.time_scale`，钳制 0.1–20 |
+| `time_scale` | `{scale}` | `{time_scale, state}` 默认关闭 |
 
-所有动作方法成功后都附带最新快照，调用方无需再发 `state`。
+**业务失败 vs 协议失败**：`invoke` 调用的游戏方法返回 `{"ok": false, "error": "..."}`
+时，协议层仍是 `ok: true`（调用成功，业务说不行）；只有参数不合法、工具不存在这类
+调用方式错误才走 `ok: false`。两种必须分清，否则调用方无法判断该改参数还是该改策略。
 
 ## 状态快照 `state`
 
@@ -57,20 +97,23 @@
 }
 ```
 
-- `elements`：当前场景内**可见**的 `BaseButton`（自动）或 `aiplay_element` 组成员（`Control`），上限 60；`aiplay_hidden` 组的祖先整棵排除。
-- `id` 是稳定寻址：`/<场景名>/<相对路径>`，`click`/`call` 的 `path` 也接受该 id 或场景相对路径。
+- `elements`：当前场景内**可见**的 `BaseButton`（自动）或 `aiplay_element` 组成员（`Control`），上限 60。
+- `id` 是稳定寻址：`/<场景名>/<相对路径>`。
 - `label`：`aiplay_label` 元数据 > 按钮文本 > 节点名。
 - `game`：`register_state_provider` 返回的字典；JSON 超 4KB 时字符串逐级截断并标 `truncated`。
-- 快照给**游戏级语义**而非节点树——这是协议的核心取舍。
 
 ## `wait_until` 断言语法
 
 - `expr`：`key op literal`，多条件以 ` and ` 连接（不区分大小写），**最多 3 个**。
-- `op`：`==` `!=` `>` `<` `>=` `<=`。
-- `literal`：`true`/`false`、数字、`"字符串"`（单引号同）、裸词按字符串。
-- 比较针对 `game` 字典顶层键：数值按 float、布尔按 bool、字符串按字典序；键缺失时仅 `!=` 成立。
+- `op`：`==` `!=` `>` `<` `>=` `<=`；`literal`：`true`/`false`、数字、`"字符串"`、裸词。
+- 比较针对 `game` **顶层键**（不支持 `a.b` 这种嵌套路径）。
 - `max_frames` 默认 3600（物理帧）。超时返回 `{timeout: true, state}`。
-- 限制：字符串值内不能含 ` and `；表达式在**物理帧**上求值（与游戏逻辑同步，不受 `time_scale` 影响节奏但帧数随缩放变快/慢）。
+
+**已知限制（协议天花板，不是实现 bug）**：只能断言顶层扁平键，所以开发者必须把
+要等的状态摊平进 game 字典（demo 的 `plot0_progress` 就是这么来的）。这意味着
+"统一约定"只统一了断言语法，没有统一状态形状——每款游戏仍得自己定一套摊平规则。
+v0.4 若要让 `wait_until` 真正跨游戏通用，得给 `game` 加一层路径寻址或让 provider
+声明可等待字段。
 
 ## 游戏侧接入（开发者视角）
 
@@ -79,7 +122,7 @@
 $PlantButton.set_meta("aiplay_label", "种植萝卜")
 $DebugPanel.add_to_group("aiplay_hidden")
 
-# 2) 状态与动作 provider（可选；不写则 elements 按钮派生 actions、game={}）
+# 2) 状态与动作 provider（可选）
 AIPlay.register_state_provider(func() -> Dictionary: return {"gold": gold})
 AIPlay.register_actions_provider(func() -> Array: return [{"action": "plant", "plot": 0}])
 
@@ -88,22 +131,42 @@ const AIPLAY_TOOLS = {
   "plant": {"description": "种植", "args": {"plot": "int", "seed": "string"}},
 }
 # 对应方法 func plant(plot: int, seed: String) -> Variant
+
+# 4) 逃生舱（可选，且必须同时打开 aiplay/allow_call）
+AIPlay.register_callable("status", ".")   # "." = 场景根
 ```
 
-`args` 类型：`int`/`float`/`string`/`bool`；JSON 数字到 int 要求整数值。未知类型原样透传。
-桥会把每个声明展开成 `game_<name>` 动态工具，`invoke` 只认 `game_` 前缀。
+`args` 类型：`int`/`float`/`string`/`bool`；JSON 数字到 int 要求整数值。
 
 ## MCP 桥 `bridge/server.mjs`
 
-零依赖 Node ≥22（全局 WebSocket）。stdio 上行下行换行分隔 JSON-RPC 2.0。
+零依赖 Node ≥22（全局 WebSocket）。stdio 换行分隔 JSON-RPC 2.0。
 
-- 静态工具：12 个 `aiplay_*`（协议方法 1:1）。
-- 动态工具：连接后拉 `tools`，每个声明生成 `game_*` 工具（参数 schema 自动推导，全部必填）。
+- 静态工具：12 个 `aiplay_*`（协议方法 1:1，含 `aiplay_call`，即便被禁用也列出——
+  Agent 需要看到"有这个能力但被关了"的明确报错，而不是工具凭空消失）。
+- 动态工具：连接后拉 `tools`，每个声明生成 `game_*`（参数 schema 自动推导，全部必填）。
+- **自动鉴权**：从 `user://` 默认位置读 token 并在连接后立即 `auth`。
+- **能力声明诚实**：只有当客户端在 `initialize` 里声明 `capabilities.tools.listChanged`
+  时才回 `listChanged: true`，并且真的在游戏上线导致动态工具集变化时发
+  `notifications/tools/list_changed`。
 - `wait`/`wait_until` 的 MCP 超时按 `max_frames` 推导（上限 600s）。
-- 游戏未启动时桥正常工作，`tools/list` 只回静态工具；调用报连接错误。
 
-## 安全边界（有意为之）
+## 安全边界
 
-- `call` 拦截销毁类方法与下划线方法，且拒绝 `aiplay_hidden` 子树——逃生舱不是后门。
-- 不提供任意代码执行（无 `eval`/`Expression`）。
-- 只绑回环；默认关闭；快照有硬上限。
+| 边界 | 做法 | 已验证 |
+|---|---|---|
+| 外部网络 | 只绑 `127.0.0.1` | ✅ |
+| 本机浏览器 | token 鉴权（Origin 在引擎层取不到） | ✅ 未鉴权连接读不到任何状态 |
+| 连接耗尽 | 连接数上限 8 + 未鉴权 600 帧超时 + 3 次错 token 断开 | ✅ |
+| 任意代码执行 | 无 eval / Expression | ✅ |
+| 状态篡改 | `call` 默认关；开启后只认登记的方法名+节点对，且拦截 `set`/`call_deferred`/`set_script` 等 | ✅ 实测绕过失败 |
+| 越权点击 | `click` 校验 `is_visible_in_tree()` + `disabled` | ✅ 置灰/隐藏按钮点了无效 |
+| 时间作弊 | `time_scale` 默认关（放置游戏压时间等于印钱） | ✅ |
+| 快照体积 | elements ≤60、game ≤4KB，超限标 `truncated` | ✅ 实测 735B |
+
+**仍然存在的风险（诚实声明）**：
+- `invoke` 调用的是开发者自己写的方法。协议无法替你保证那句 `harvest()` 里没有后门。
+- 白名单是"方法名 → 节点路径"的绑定，挡的是越权调用，挡不住游戏方法自身的业务 bug。
+- token 存在 `user://`，同机其它进程若以同一用户身份运行可以读到它。
+  这是本机工具的一般性问题；跨用户隔离靠操作系统的文件权限。
+- 没有真实鼠标注入，所以遮挡、多点触控这类"物理世界"问题不在协议范围内。

@@ -1,15 +1,50 @@
 #!/usr/bin/env node
-// AIPlay MCP 桥（stdio JSON-RPC ↔ ws://127.0.0.1:8765，协议 aiplay/0.2）
+// AIPlay MCP 桥（stdio JSON-RPC ↔ ws://127.0.0.1:8765，协议 aiplay/0.3）
 // 零依赖：Node >= 22（全局 WebSocket）。
-//   node bridge/server.mjs [--url ws://127.0.0.1:8765]
-//   AIPLAY_URL=ws://127.0.0.1:8765 node bridge/server.mjs
+//   node bridge/server.mjs [--url ws://127.0.0.1:8765] [--token <tok>] [--token-file <path>]
+//   AIPLAY_URL=... AIPLAY_TOKEN=... node bridge/server.mjs
 // 游戏未启动时桥照常工作，动态 game_* 工具为空。
+// 凭据解析顺序：--token > AIPLAY_TOKEN > --token-file > AIPLAY_TOKEN_FILE > 各平台 user:// 默认位置。
 
 import { createInterface } from "node:readline";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const argv = process.argv.slice(2);
 const urlIdx = argv.indexOf("--url");
 const WS_URL = urlIdx >= 0 ? argv[urlIdx + 1] : (process.env.AIPLAY_URL || "ws://127.0.0.1:8765");
+
+function argValue(flag) {
+	const i = argv.indexOf(flag);
+	return i >= 0 ? argv[i + 1] : undefined;
+}
+
+// Godot 的 user:// 在各平台的落地位置；project name 由 --project 覆盖
+function userDirCandidates(projectName) {
+	const home = homedir();
+	return [
+		join(home, "Library", "Application Support", "Godot", "app_userdata", projectName),
+		join(home, ".local", "share", "godot", "app_userdata", projectName),
+		join(home, "AppData", "Roaming", "Godot", "app_userdata", projectName),
+	];
+}
+
+function resolveToken() {
+	const direct = argValue("--token") || process.env.AIPLAY_TOKEN;
+	if (direct) return direct.trim();
+	const explicit = argValue("--token-file") || process.env.AIPLAY_TOKEN_FILE;
+	if (explicit) {
+		try { return readFileSync(explicit, "utf8").trim(); } catch { return ""; }
+	}
+	const project = argValue("--project") || process.env.AIPLAY_PROJECT || "AIPlay Demo";
+	for (const dir of userDirCandidates(project)) {
+		try { return readFileSync(join(dir, "aiplay.token"), "utf8").trim(); } catch { /* keep looking */ }
+	}
+	return "";
+}
+
+const TOKEN = resolveToken();
 
 // ---------------------------------------------------------------------------
 // WebSocket 客户端（懒连接，用完不断开；断了下次调用自动重连）
@@ -17,11 +52,30 @@ const WS_URL = urlIdx >= 0 ? argv[urlIdx + 1] : (process.env.AIPLAY_URL || "ws:/
 
 let ws = null;
 let wsReady = null;
+let authed = false;
 let nextId = 1;
 const pending = new Map();
 
+// 握手令牌由桥在首次连接时自动送达：游戏侧一旦要求鉴权，
+// 浏览器拿不到这个文件，也就无法伪造连接。
+function sendAuth(sock) {
+	return new Promise((resolve, reject) => {
+		const id = nextId++;
+		const timer = setTimeout(() => {
+			pending.delete(id);
+			reject(new Error("auth timeout"));
+		}, 4000);
+		pending.set(id, {
+			resolve: (r) => { authed = true; resolve(r); },
+			reject,
+			timer,
+		});
+		sock.send(JSON.stringify({ id, method: "auth", params: { token: TOKEN } }));
+	});
+}
+
 function connect() {
-	if (ws && ws.readyState === WebSocket.OPEN) return Promise.resolve(ws);
+	if (ws && ws.readyState === WebSocket.OPEN && authed) return Promise.resolve(ws);
 	if (wsReady) return wsReady;
 	wsReady = new Promise((resolve, reject) => {
 		const sock = new WebSocket(WS_URL);
@@ -30,19 +84,29 @@ function connect() {
 			wsReady = null;
 			reject(new Error("connect timeout: " + WS_URL));
 		}, 4000);
-		sock.onopen = () => {
+		sock.onopen = async () => {
 			clearTimeout(timer);
+			sock.onclose = () => { ws = null; authed = false; };
+			sock.onmessage = (ev) => onWsMessage(ev);
 			ws = sock;
 			wsReady = null;
-			resolve(sock);
+			try {
+				await sendAuth(sock);
+				resolve(sock);
+			} catch (e) {
+				// 鉴权失败要先关连接再抛，否则半开连接会一直卡在缓存里
+				try { sock.close(); } catch {}
+				ws = null;
+				authed = false;
+				reject(e);
+			}
 		};
 		sock.onerror = () => {
 			clearTimeout(timer);
 			wsReady = null;
+			authed = false;
 			reject(new Error("connect failed: " + WS_URL));
 		};
-		sock.onclose = () => { ws = null; };
-		sock.onmessage = (ev) => onWsMessage(ev);
 	});
 	return wsReady;
 }
@@ -150,24 +214,50 @@ function argsToSchema(args) {
 	return { type: "object", properties, required };
 }
 
+let lastDynamicSig = "";
+
 async function listTools() {
 	const tools = STATIC_TOOLS.map(([name, , description, schema]) => ({
 		name, description, inputSchema: schema,
 	}));
+	let dynamic = [];
 	try {
 		const res = await call("tools", {}, 5000);
 		const list = res && Array.isArray(res.tools) ? res.tools : [];
-		for (const t of list) {
-			tools.push({
-				name: t.name,
-				description: t.description || "",
-				inputSchema: argsToSchema(t.args),
-			});
-		}
+		dynamic = list.map((t) => ({
+			name: t.name,
+			description: t.description || "",
+			inputSchema: argsToSchema(t.args),
+		}));
 	} catch {
 		// 游戏未启动：动态工具为空
 	}
-	return { tools };
+	lastDynamicSig = dynamic.map((t) => t.name).sort().join(",");
+	return { tools: tools.concat(dynamic) };
+}
+
+// 桥可能先于游戏启动。发现游戏上线（动态工具集变了）就主动通知客户端刷新，
+// 而不是让客户端抱着旧的 tools/list 缓存干等——能力声明必须和实际行为一致。
+function notifyToolListChanged() {
+	if (!clientWantsListChanged) return;
+	process.stdout.write(JSON.stringify({
+		jsonrpc: "2.0",
+		method: "notifications/tools/list_changed",
+	}) + "\n");
+}
+
+async function watchForGame() {
+	try {
+		const res = await call("tools", {}, 3000);
+		const list = res && Array.isArray(res.tools) ? res.tools : [];
+		const sig = list.map((t) => t.name).sort().join(",");
+		if (sig && sig !== lastDynamicSig) {
+			lastDynamicSig = sig;
+			notifyToolListChanged();
+		}
+	} catch {
+		/* 游戏还没起，下次再试 */
+	}
 }
 
 async function callTool(name, args) {
@@ -191,6 +281,15 @@ function respondError(id, code, message) {
 	process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }) + "\n");
 }
 
+let clientWantsListChanged = false;
+let watcher = null;
+
+function startGameWatcher() {
+	if (watcher) return;
+	watcher = setInterval(watchForGame, 3000);
+	if (watcher.unref) watcher.unref();
+}
+
 async function handle(msg) {
 	const { id, method, params } = msg;
 	const isNotif = id === undefined || id === null;
@@ -198,11 +297,18 @@ async function handle(msg) {
 		let result;
 		switch (method) {
 			case "initialize":
+				// 只有客户端真的声明支持 tools.listChanged 时才回这个能力，
+				// 否则就是"说了做不到"——对方会一直等一个永不到来的通知。
+				clientWantsListChanged = Boolean(
+					params && params.capabilities && params.capabilities.tools &&
+					params.capabilities.tools.listChanged,
+				);
 				result = {
 					protocolVersion: (params && params.protocolVersion) || "2024-11-05",
-					capabilities: { tools: { listChanged: true } },
-					serverInfo: { name: "aiplay-bridge", version: "0.2.0" },
+					capabilities: { tools: { listChanged: clientWantsListChanged } },
+					serverInfo: { name: "aiplay-bridge", version: "0.3.0" },
 				};
+				startGameWatcher();
 				break;
 			case "ping":
 				result = {};

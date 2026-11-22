@@ -11,12 +11,17 @@ const AIPLAY_TOOLS = {
 	"plant": {"description": "在指定地块种下种子", "args": {"plot": "int", "seed": "string"}},
 	"harvest": {"description": "收获指定地块", "args": {"plot": "int"}},
 	"status": {"description": "查看农场状态", "args": {}},
+	"reset": {"description": "把农场恢复到开局状态（仅供测试与演示）", "args": {}},
+	"set_plot_disabled": {"description": "测试助手：把地块按钮置灰/恢复", "args": {"plot": "int", "disabled": "bool"}},
+	"set_plot_visible": {"description": "测试助手：显示/隐藏地块按钮", "args": {"plot": "int", "vis": "bool"}},
 }
 
 var seeds := 5
 var gold := 0
 var harvested := 0
 var plots: Array[Dictionary] = []
+
+const INITIAL_SEEDS := 5
 
 var _stats_label: Label
 var _debug_label: Label
@@ -33,6 +38,9 @@ func _ready() -> void:
 	if aiplay != null:
 		aiplay.register_state_provider(_aiplay_state)
 		aiplay.register_actions_provider(_aiplay_actions)
+		# 逃生舱默认关（aiplay/allow_call=false）。要用时再打开上面这行开关，
+		# 并按下面这样逐条登记：方法名 → 允许被调的节点路径（"." 指场景根）
+		# aiplay.register_callable("status", ".")
 
 
 func _build_ui() -> void:
@@ -149,6 +157,52 @@ func harvest(plot: int) -> int:
 
 func status() -> Dictionary:
 	return _aiplay_state()
+
+
+## 测试助手：让"点了会推进状态"的按钮进入不可点状态，
+## 用来验证 click 与真人同权（disabled / 不可见都拒绝）。
+func set_plot_disabled(plot: int, disabled: bool) -> Dictionary:
+	if plot < 0 or _plot_box == null or plot >= _plot_box.get_child_count():
+		return {"ok": false, "error": "bad plot"}
+	var b := _plot_box.get_child(plot) as Button
+	if b == null:
+		return {"ok": false, "error": "not a button"}
+	b.disabled = disabled
+	return {"ok": true, "plot": plot, "disabled": disabled}
+
+
+func set_plot_visible(plot: int, vis: bool) -> Dictionary:
+	if plot < 0 or _plot_box == null or plot >= _plot_box.get_child_count():
+		return {"ok": false, "error": "bad plot"}
+	var b := _plot_box.get_child(plot) as Button
+	if b == null:
+		return {"ok": false, "error": "not a button"}
+	b.visible = vis
+	return {"ok": true, "plot": plot, "visible": vis}
+
+
+## 把整块地恢复到开局状态。测试套件靠它自清理，
+## 否则验收基线只在"第一次跑"时成立。
+func reset() -> Dictionary:
+	seeds = INITIAL_SEEDS
+	gold = 0
+	harvested = 0
+	for i in plots.size():
+		plots[i] = {"state": "empty", "t": 0.0, "seed": ""}
+	_reset_ui_flags()
+	_refresh()
+	return {"ok": true, "reset": true}
+
+
+func _reset_ui_flags() -> void:
+	if _plot_box == null:
+		return
+	for i in _plot_box.get_child_count():
+		var b := _plot_box.get_child(i) as Button
+		if b == null:
+			continue
+		b.visible = true
+		b.disabled = false
 
 
 # ---------------------------------------------------------------------------
